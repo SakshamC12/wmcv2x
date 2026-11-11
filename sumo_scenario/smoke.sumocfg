@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <input>
+        <net-file value="smoke.net.xml"/>
+        <route-files value="smoke.rou.xml"/>
+    </input>
+    <time>
+        <begin value="0"/>
+        <end value="3"/>
+        <step-length value="0.1"/>
+    </time>
+    <report>
+        <no-step-log value="true"/>
+        <duration-log.disable value="true"/>
+    </report>
+</configuration>

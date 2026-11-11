@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<routes>
+    <vType id="passenger" vClass="passenger" carFollowModel="Krauss"
+           accel="2.6" decel="8" emergencyDecel="8" sigma="0"
+           minGap="2.5" length="5" maxSpeed="33.3"
+           lcStrategic="0" lcCooperative="0" lcSpeedGain="0"
+           lcKeepRight="0"/>
+    <vType id="emergency_truck_type" vClass="truck" carFollowModel="Krauss"
+           accel="1.3" decel="8" emergencyDecel="8" sigma="0"
+           minGap="2.5" length="12" maxSpeed="27.8"
+           lcStrategic="0" lcCooperative="0" lcSpeedGain="0"
+           lcKeepRight="0"/>
+
+    <route id="straight" edges="highway"/>
+
+    <vehicle id="emergency_truck" type="emergency_truck_type"
+             route="straight" depart="0" departLane="0"
+             departPos="700" departSpeed="20"/>
+    <vehicle id="car_01" type="passenger" route="straight"
+             depart="0" departLane="0" departPos="660" departSpeed="24"/>
+    <vehicle id="car_02" type="passenger" route="straight"
+             depart="0" departLane="0" departPos="610" departSpeed="27"/>
+    <vehicle id="car_03" type="passenger" route="straight"
+             depart="0" departLane="0" departPos="560" departSpeed="30"/>
+    <vehicle id="car_04" type="passenger" route="straight"
+             depart="0" departLane="1" departPos="650" departSpeed="25"/>
+    <vehicle id="car_05" type="passenger" route="straight"
+             depart="0" departLane="1" departPos="600" departSpeed="24"/>
+    <vehicle id="car_06" type="passenger" route="straight"
+             depart="0" departLane="1" departPos="550" departSpeed="23"/>
+</routes>
