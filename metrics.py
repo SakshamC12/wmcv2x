@@ -9,6 +9,8 @@ def calculate_sumo_metrics(
     warning_records: Sequence[dict[str, object]],
     response_vehicle_ids: Iterable[str],
     collision_pairs: Iterable[tuple[str, str]],
+    minimum_separation_m: float | None = None,
+    minimum_ttc_s: float | None = None,
 ) -> dict[str, object]:
     packet_delivery_ratio = (
         messages_received / transmission_attempts * 100
@@ -58,16 +60,38 @@ def calculate_sumo_metrics(
             response_ids - collision_vehicle_ids
         ),
         "collision_vehicle_ids": sorted(collision_vehicle_ids),
-        "communication_model": "in-process; zero modeled delay; no packet loss",
+        "minimum_vehicle_separation_m": (
+            round(minimum_separation_m, 2)
+            if minimum_separation_m is not None
+            else None
+        ),
+        "minimum_ttc_s": (
+            round(minimum_ttc_s, 2)
+            if minimum_ttc_s is not None
+            else None
+        ),
+        "communication_model": (
+            "software-level in-process delivery; no physical radio propagation"
+        ),
         "transmission_count_semantics": (
-            "messages_transmitted counts broadcasts; transmission_attempts "
-            "counts one recipient-directed copy per eligible nearby vehicle"
+            "messages_transmitted counts source/relay transmissions; "
+            "transmission_attempts counts recipient-directed copies"
         ),
         "communication_latency_semantics": (
-            "Modeled delay only; not wall-clock processing time or radio latency"
+            "Zero modeled delay; not measured processing time or wireless latency"
         ),
         "warning_distance_semantics": (
-            "Mean front-position separation at message receipt"
+            "Mean longitudinal front-position separation at message receipt"
+        ),
+        "minimum_separation_semantics": (
+            "Minimum longitudinal same-lane bumper gap over the SUMO run"
+        ),
+        "minimum_ttc_semantics": (
+            "Minimum positive-gap closing TTC over same-lane vehicle pairs"
+        ),
+        "collision_count_semantics": (
+            "Number of unique vehicle pairs reported by SUMO collision events; "
+            "repeated contacts between the same pair count once"
         ),
         "collision_avoidance_semantics": (
             "Responders without a recorded collision; not a counterfactual "

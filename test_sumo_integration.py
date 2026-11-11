@@ -16,6 +16,11 @@ class SumoV2XIntegrationTest(unittest.TestCase):
              if event["event_type"] == "EMERGENCY_BRAKING"],
             [5.0],
         )
+        self.assertEqual(
+            [event["time"] for event in results["events"]
+             if event["event_type"] == "V2X_BRAKE_RESPONSE"],
+            [5.5, 5.5, 5.5],
+        )
         self.assertEqual(metrics["messages_transmitted"], 1)
         self.assertEqual(metrics["transmission_attempts"], 6)
         self.assertEqual(metrics["messages_received"], 6)

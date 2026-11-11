@@ -1,10 +1,476 @@
 
 import time
 import math
+from dataclasses import asdict, replace
+from queue import Empty
+
 import streamlit as st
 import matplotlib.pyplot as plt
 
+from browser_renderer import render_highway_canvas
+from simulation_worker import SimulationWorker, WorkerState
 from simulation import run_simulation
+from sumo_simulation import SimulationSettings
+from v2x_communication import CommunicationMode
+
+
+def _initialize_command_center_state() -> SimulationWorker:
+    if "command_center_worker" not in st.session_state:
+        st.session_state.command_center_worker = SimulationWorker(
+            SimulationSettings(),
+            telemetry_step_delay_seconds=0.1,
+        )
+        st.session_state.command_center_telemetry = None
+        st.session_state.command_center_events = []
+        st.session_state.command_center_comparison = False
+    st.session_state.setdefault("command_center_comparison", False)
+    st.session_state.setdefault("command_center_render_generation", 0)
+    return st.session_state.command_center_worker
+
+
+def _warning_level(message: dict[str, object]) -> str:
+    if not message.get("same_lane_risk"):
+        return "OTHER LANE"
+    ttc = message.get("ttc_at_warning_s")
+    if ttc is None:
+        return "NOT CLOSING"
+    ttc_value = float(ttc)
+    if ttc_value <= 3:
+        return "CRITICAL"
+    if ttc_value <= 6:
+        return "HIGH"
+    if message.get("response_recommended"):
+        return "HAZARD"
+    return "MONITOR"
+
+
+@st.fragment(run_every=0.25)
+def _render_command_center_live() -> None:
+    worker = _initialize_command_center_state()
+    ready = worker.state is WorkerState.READY
+
+    mode_labels = {
+        CommunicationMode.DISABLED: "V2X disabled (baseline)",
+        CommunicationMode.V2V: "V2V only",
+        CommunicationMode.V2I: "V2I only",
+        CommunicationMode.COMBINED: "Combined V2X",
+    }
+    selected_mode = st.selectbox(
+        "Communication mode",
+        options=list(CommunicationMode),
+        format_func=mode_labels.__getitem__,
+        index=list(CommunicationMode).index(worker.communication_mode),
+        disabled=not ready,
+        key="command_center_mode",
+    )
+    rsu_range = st.slider(
+        "RSU communication range (m)",
+        min_value=50,
+        max_value=500,
+        value=int(worker.settings.roadside_unit.communication_range_m),
+        step=25,
+        disabled=not ready,
+        key="command_center_rsu_range",
+    )
+    if ready:
+        worker.communication_mode = selected_mode
+        worker.settings = replace(
+            worker.settings,
+            roadside_unit=replace(
+                worker.settings.roadside_unit,
+                communication_range_m=float(rsu_range),
+            ),
+        )
+
+    controls = st.columns(6)
+    if controls[0].button(
+        "▶ Start",
+        type="primary",
+        disabled=not ready,
+        width="stretch",
+    ):
+        try:
+            st.session_state.command_center_render_generation += 1
+            st.session_state.command_center_telemetry = None
+            st.session_state.command_center_events = []
+            worker.comparison_modes = None
+            st.session_state.command_center_comparison = False
+            worker.start()
+        except RuntimeError as error:
+            st.error(str(error))
+    if controls[1].button(
+        "⏸ Pause",
+        disabled=worker.state is not WorkerState.RUNNING,
+        width="stretch",
+    ):
+        try:
+            worker.pause()
+        except RuntimeError as error:
+            st.warning(str(error))
+    if controls[2].button(
+        "▶ Resume",
+        disabled=worker.state
+        not in (WorkerState.PAUSED, WorkerState.PAUSE_REQUESTED),
+        width="stretch",
+    ):
+        try:
+            worker.resume()
+        except RuntimeError as error:
+            st.warning(str(error))
+    if controls[3].button(
+        "⏹ Stop",
+        disabled=worker.state
+        not in (
+            WorkerState.RUNNING,
+            WorkerState.PAUSE_REQUESTED,
+            WorkerState.PAUSED,
+            WorkerState.RESUME_REQUESTED,
+        ),
+        width="stretch",
+    ):
+        worker.stop()
+    if controls[4].button(
+        "↺ Reset",
+        width="stretch",
+    ):
+        try:
+            worker.reset()
+        except TimeoutError as error:
+            st.error(str(error))
+        else:
+            st.session_state.command_center_telemetry = None
+            st.session_state.command_center_events = []
+            st.session_state.command_center_comparison = False
+            st.session_state.command_center_render_generation += 1
+            worker.comparison_modes = None
+
+    if controls[5].button(
+        "Compare all modes",
+        help="Run disabled, V2V, V2I, and combined scenarios sequentially.",
+        disabled=not ready,
+        width="stretch",
+    ):
+        try:
+            worker.comparison_modes = tuple(CommunicationMode)
+            st.session_state.command_center_comparison = True
+            st.session_state.command_center_render_generation += 1
+            st.session_state.command_center_telemetry = None
+            st.session_state.command_center_events = []
+            worker.start()
+        except RuntimeError as error:
+            st.error(str(error))
+
+    while True:
+        try:
+            st.session_state.command_center_telemetry = (
+                worker.telemetry_queue.get_nowait()
+            )
+        except Empty:
+            break
+
+    while True:
+        try:
+            st.session_state.command_center_events.append(
+                worker.event_queue.get_nowait()
+            )
+        except Empty:
+            break
+
+    telemetry = st.session_state.command_center_telemetry
+    events = st.session_state.command_center_events
+    state = worker.state
+
+    st.caption(f"Simulation status: **{state.value.replace('_', ' ').title()}**")
+    if worker.error:
+        st.error(worker.error)
+
+    st.subheader("Live SUMO Highway")
+    render_highway_canvas(
+        telemetry=asdict(telemetry) if telemetry is not None else None,
+        vehicle_communication_range_m=worker.settings.communication_range_m,
+        communication_links=[
+            {
+                **event.data,
+                "simulation_time": event.simulation_time,
+            }
+            for event in events
+            if event.event_type == "V2X_TRANSMISSION"
+        ],
+        key=(
+            "command-center-highway-"
+            f"{st.session_state.command_center_render_generation}"
+        ),
+    )
+
+    vehicles = telemetry.vehicles if telemetry is not None else ()
+    if vehicles:
+        st.subheader("Vehicle Telemetry")
+        st.dataframe(
+            [
+                {
+                    "Vehicle ID": vehicle.vehicle_id,
+                    "Type": vehicle.vehicle_type,
+                    "Lane": vehicle.lane_id,
+                    "Position (m)": round(vehicle.position, 2),
+                    "Speed (km/h)": round(vehicle.speed * 3.6, 1),
+                }
+                for vehicle in vehicles
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+
+    received_messages = [
+        event.data["message"]
+        for event in events
+        if event.event_type == "V2X_MESSAGE_RECEIVED"
+    ]
+    response_events = [
+        event for event in events
+        if event.event_type == "V2X_BRAKE_RESPONSE"
+    ]
+    results = worker.results
+    comparison_results = (
+        results.get("comparison_results")
+        if results and st.session_state.command_center_comparison
+        else None
+    )
+    metrics = results.get("metrics") if results else None
+    st.subheader("V2X Performance")
+    if comparison_results:
+        st.caption("Completed scenario metrics (all communication values are modeled).")
+        st.dataframe(
+            [
+                {
+                    "Mode": mode_labels[CommunicationMode(mode)],
+                    "Collision pairs": scenario["metrics"]["collisions"],
+                    "Minimum separation (m)": (
+                        scenario["metrics"]["minimum_vehicle_separation_m"]
+                    ),
+                    "Minimum TTC (s)": scenario["metrics"]["minimum_ttc_s"],
+                    "Responding vehicles": (
+                        scenario["metrics"]["vehicles_responding"]
+                    ),
+                    "Warning distance (m)": scenario["metrics"]["warning_distance_m"],
+                    "Delivery ratio (%)": (
+                        scenario["metrics"]["packet_delivery_ratio_percent"]
+                    ),
+                    "Modeled latency (ms)": (
+                        scenario["metrics"]["communication_latency_ms"]
+                    ),
+                }
+                for mode, scenario in comparison_results.items()
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+    if metrics:
+        metric_values = [
+            ("Broadcasts", metrics["messages_transmitted"]),
+            ("Transmission attempts", metrics["transmission_attempts"]),
+            ("Messages received", metrics["messages_received"]),
+            (
+                "Packet delivery ratio",
+                f"{metrics['packet_delivery_ratio_percent']:.1f}%",
+            ),
+            (
+                "Modeled latency",
+                (
+                    f"{metrics['communication_latency_ms']:.4f} ms"
+                    if metrics["communication_latency_ms"] is not None
+                    else "—"
+                ),
+            ),
+            (
+                "Mean warning distance",
+                (
+                    f"{metrics['warning_distance_m']:.1f} m"
+                    if metrics["warning_distance_m"] is not None
+                    else "—"
+                ),
+            ),
+            (
+                "Mean TTC at warning",
+                (
+                    f"{metrics['ttc_at_warning_s']:.2f} s"
+                    if metrics["ttc_at_warning_s"] is not None
+                    else "—"
+                ),
+            ),
+            ("Responding vehicles", metrics["vehicles_responding"]),
+            ("Collision pairs", metrics["collisions"]),
+            (
+                "Responders without collision",
+                metrics["vehicles_avoiding_collisions"],
+            ),
+            (
+                "Minimum same-lane separation",
+                (
+                    f"{metrics['minimum_vehicle_separation_m']:.2f} m"
+                    if metrics["minimum_vehicle_separation_m"] is not None
+                    else "—"
+                ),
+            ),
+            (
+                "Minimum positive-gap TTC",
+                (
+                    f"{metrics['minimum_ttc_s']:.2f} s"
+                    if metrics["minimum_ttc_s"] is not None
+                    else "—"
+                ),
+            ),
+        ]
+    else:
+        warning_distances = [
+            float(message["warning_distance_m"])
+            for message in received_messages
+        ]
+        warning_ttcs = [
+            float(message["ttc_at_warning_s"])
+            for message in received_messages
+            if message["ttc_at_warning_s"] is not None
+        ]
+        modeled_latencies = [
+            float(message["communication_latency_ms"])
+            for message in received_messages
+        ]
+        active = state in (
+            WorkerState.RUNNING,
+            WorkerState.PAUSE_REQUESTED,
+            WorkerState.PAUSED,
+            WorkerState.RESUME_REQUESTED,
+        )
+        message_count = len(received_messages)
+        metric_values = [
+            (
+                "Broadcasts",
+                sum(
+                    event.event_type == "EMERGENCY_BRAKING"
+                    for event in events
+                ),
+            ),
+            ("Transmission attempts", message_count),
+            ("Messages received", message_count),
+            (
+                "Packet delivery ratio",
+                "Pending"
+                if not message_count
+                else "100% modeled",
+            ),
+            (
+                "Modeled latency",
+                (
+                    f"{sum(modeled_latencies) / len(modeled_latencies):.4f} ms"
+                    if modeled_latencies
+                    else "—"
+                ),
+            ),
+            (
+                "Mean warning distance",
+                (
+                    f"{sum(warning_distances) / len(warning_distances):.1f} m"
+                    if warning_distances
+                    else "—"
+                ),
+            ),
+            (
+                "Mean TTC at warning",
+                (
+                    f"{sum(warning_ttcs) / len(warning_ttcs):.2f} s"
+                    if warning_ttcs
+                    else "—"
+                ),
+            ),
+            ("Responding vehicles", len(response_events)),
+            ("Collision pairs", "Pending" if active else "Unavailable"),
+            ("Responders without collision", "Pending" if active else "—"),
+            ("Minimum same-lane separation", "Pending" if active else "Unavailable"),
+            ("Minimum positive-gap TTC", "Pending" if active else "Unavailable"),
+        ]
+
+    for row_start in range(0, len(metric_values), 5):
+        metric_columns = st.columns(5)
+        for column, (label, value) in zip(
+            metric_columns,
+            metric_values[row_start:row_start + 5],
+        ):
+            column.metric(label, value)
+    st.caption(
+        "Communication metrics are in-process simulation values, not wireless "
+        "measurements. Warning distance/TTC are values at message reception. "
+        "Responders without collision is not a counterfactual prevention claim."
+    )
+
+    if received_messages:
+        st.subheader("Receiver Risk Assessments")
+        st.dataframe(
+            [
+                {
+                    "Vehicle": message["receiver_id"],
+                    "Warning level": _warning_level(message),
+                    "Warning distance (m)": message["warning_distance_m"],
+                    "TTC at reception (s)": message["ttc_at_warning_s"],
+                    "Brake response": (
+                        "Scheduled"
+                        if message["response_recommended"]
+                        else "Not recommended"
+                    ),
+                }
+                for message in received_messages
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+
+    st.subheader("V2X Event Log")
+    simulation_events = [
+        event for event in events
+        if event.event_type not in ("WORKER_STATE",)
+    ]
+    if simulation_events:
+        st.dataframe(
+            [
+                {
+                    "Simulation time (s)": event.simulation_time,
+                    "Event": event.event_type,
+                    "Sender": (
+                        event.data.get("sender_id")
+                        or event.data.get("message", {}).get("sender_id", "")
+                    ),
+                    "Receiver": (
+                        event.data.get("receiver_id")
+                        or event.data.get("vehicle_id", "")
+                        or event.data.get("message", {}).get("receiver_id", "")
+                    ),
+                    "Communication": (
+                        event.data.get("communication_type")
+                        or event.data.get("message", {}).get(
+                            "communication_type", ""
+                        )
+                    ),
+                    "Details": (
+                        event.data.get("error")
+                        or event.data.get("risk_reason")
+                        or event.data.get("message_id")
+                        or ""
+                    ),
+                }
+                for event in reversed(simulation_events)
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.caption("No V2X events yet.")
+
+
+def _render_command_center() -> None:
+    st.title("V2X Command Center")
+    st.caption(
+        "SUMO traffic, vehicle telemetry, V2X risk assessments, and "
+        "communication metrics in one browser view."
+    )
+    _render_command_center_live()
 
 
 # --------------------------------------------------
@@ -16,6 +482,16 @@ st.set_page_config(
     page_icon="🚗",
     layout="wide"
 )
+
+application_view = st.sidebar.radio(
+    "Application view",
+    ("Legacy Dashboard", "V2X Command Center"),
+    key="application_view",
+)
+
+if application_view == "V2X Command Center":
+    _render_command_center()
+    st.stop()
 
 st.title("🚘 V2X Collision Avoidance System")
 st.caption(

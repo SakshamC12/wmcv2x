@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #111827; }
+    canvas { display: block; width: 100%; height: 460px; }
+  </style>
+</head>
+<body>
+<canvas id="highway" aria-label="Animated SUMO highway traffic visualization"></canvas>
+<script>
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("highway");
+  const context = canvas.getContext("2d");
+  const state = {
+    previous: null,
+    current: null,
+    receivedAt: 0,
+    previousDrawn: null,
+    links: [],
+    seenLinks: new Set(),
+    rsu: null,
+    vehicleRange: 250,
+    label: "SUMO",
+  };
+  const colors = {
+    emergency_truck: "#ef4444",
+    car_01: "#38bdf8",
+    car_02: "#fb923c",
+    car_03: "#4ade80",
+    car_04: "#c084fc",
+    car_05: "#2dd4bf",
+    car_06: "#facc15",
+  };
+
+  function resizeCanvas() {
+    const ratio = window.devicePixelRatio || 1;
+    const bounds = canvas.getBoundingClientRect();
+    canvas.width = Math.max(1, Math.floor(bounds.width * ratio));
+    canvas.height = Math.max(1, Math.floor(bounds.height * ratio));
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  }
+
+  function receiveRender(event) {
+    if (!event.data || event.data.type !== "streamlit:render") return;
+    const args = event.data.args || {};
+    const telemetry = args.telemetry;
+    if (
+      telemetry
+      && Number.isFinite(Number(telemetry.simulation_time))
+    ) {
+      canvas.setAttribute(
+        "aria-label",
+        `Animated SUMO highway at ${Number(telemetry.simulation_time).toFixed(1)} seconds with ${(telemetry.vehicles || []).length} vehicles`
+      );
+      if (!state.current) {
+        state.previous = telemetry;
+        state.current = telemetry;
+        state.receivedAt = performance.now();
+      } else if (
+        Number(telemetry.simulation_time)
+        > Number(state.current.simulation_time)
+      ) {
+        state.previousDrawn = interpolateSnapshot(performance.now());
+        state.previous = state.previousDrawn || state.current;
+        state.current = telemetry;
+        state.receivedAt = performance.now();
+      }
+      state.rsu = telemetry.rsu || null;
+      state.label = telemetry.communication_mode || "SUMO";
+    }
+
+    state.vehicleRange = Number(args.vehicle_communication_range_m) || 250;
+    for (const link of args.communication_links || []) {
+      const signature = [
+        link.communication_type,
+        link.message_id,
+        link.sender_id,
+        link.receiver_id,
+        link.simulation_time,
+      ].join(":");
+      if (!state.seenLinks.has(signature)) {
+        state.seenLinks.add(signature);
+        state.links.push({ ...link, receivedAt: performance.now() });
+      }
+    }
+    state.links = state.links.filter(
+      link => performance.now() - link.receivedAt < 5000
+    );
+    if (state.seenLinks.size > 2000) state.seenLinks.clear();
+  }
+
+  function interpolateSnapshot(now) {
+    if (!state.current) return null;
+    if (!state.previous || state.previous === state.current) return state.current;
+    const fraction = Math.max(
+      0,
+      Math.min(1, (now - state.receivedAt) / 250)
+    );
+    const previousById = new Map(
+      (state.previous.vehicles || []).map(vehicle => [vehicle.vehicle_id, vehicle])
+    );
+    const vehicles = (state.current.vehicles || []).map(vehicle => {
+      const old = previousById.get(vehicle.vehicle_id);
+      if (!old || old.lane_id !== vehicle.lane_id) return vehicle;
+      return {
+        ...vehicle,
+        position: old.position + (vehicle.position - old.position) * fraction,
+      };
+    });
+    return { ...state.current, vehicles };
+  }
+
+  function worldToScreen(position, view) {
+    return (position - view.left) * view.scale;
+  }
+
+  function drawRoad(width, height, laneCount) {
+    context.fillStyle = "#18212f";
+    context.fillRect(0, 0, width, height);
+    const top = Math.min(58, height * 0.16);
+    const laneHeight = Math.max(20, (height - top - 38) / laneCount);
+    const roadBottom = top + laneHeight * laneCount;
+    context.fillStyle = "#343b46";
+    context.fillRect(0, top, width, laneHeight * laneCount);
+    context.strokeStyle = "#e5e7eb";
+    context.lineWidth = 2;
+    context.setLineDash([]);
+    context.beginPath();
+    context.moveTo(0, top);
+    context.lineTo(width, top);
+    context.moveTo(0, roadBottom);
+    context.lineTo(width, roadBottom);
+    context.stroke();
+    context.strokeStyle = "#cbd5e1";
+    context.lineWidth = 1;
+    context.setLineDash([14, 12]);
+    for (let lane = 1; lane < laneCount; lane++) {
+      const y = top + laneHeight * lane;
+      context.beginPath();
+      context.moveTo(0, y);
+      context.lineTo(width, y);
+      context.stroke();
+    }
+    context.setLineDash([]);
+    context.fillStyle = "#e2e8f0";
+    context.font = "10px system-ui";
+    context.textAlign = "left";
+    for (let lane = 0; lane < laneCount; lane++) {
+      context.fillText(
+        `Lane ${lane + 1}`,
+        8,
+        top + laneHeight * (lane + 0.5) + 4
+      );
+    }
+    return { top, laneHeight, roadBottom };
+  }
+
+  function drawCoverage(view, road, width, snapshot) {
+    context.save();
+    context.globalAlpha = 0.08;
+    context.strokeStyle = "#38bdf8";
+    context.fillStyle = "#38bdf8";
+    context.lineWidth = 1;
+    for (const vehicle of snapshot.vehicles || []) {
+      const x = worldToScreen(vehicle.position, view);
+      const radius = state.vehicleRange * view.scale;
+      const laneIndex = Number(String(vehicle.lane_id).split("_").pop()) || 0;
+      const centerY = road.top + road.laneHeight * (laneIndex + 0.5);
+      const isTruck = vehicle.vehicle_id === "emergency_truck";
+      context.globalAlpha = isTruck ? 0.08 : 0.025;
+      context.strokeStyle = isTruck ? "#38bdf8" : "#cbd5e1";
+      context.fillStyle = context.strokeStyle;
+      context.setLineDash(isTruck ? [7, 5] : [3, 7]);
+      context.beginPath();
+      context.ellipse(
+        x,
+        centerY,
+        radius,
+        Math.min(road.laneHeight * 0.38, 17),
+        0,
+        0,
+        Math.PI * 2
+      );
+      context.fill();
+      context.stroke();
+    }
+    if (state.rsu) {
+      const rsuX = worldToScreen(Number(state.rsu.position), view);
+      const radius = Number(state.rsu.communication_range_m) * view.scale;
+      context.globalAlpha = 0.07;
+      context.strokeStyle = "#facc15";
+      context.fillStyle = "#facc15";
+      context.beginPath();
+      context.ellipse(
+        rsuX,
+        road.top + road.laneHeight * 0.5,
+        radius,
+        Math.min(road.laneHeight * 1.8, 40),
+        0,
+        0,
+        Math.PI * 2
+      );
+      context.fill();
+      context.globalAlpha = 1;
+      context.stroke();
+      context.setLineDash([]);
+      context.fillStyle = "#facc15";
+      context.font = "bold 13px system-ui";
+      context.textAlign = "center";
+      const rsuLabel = state.rsu.unit_id || "RSU";
+      const labelWidth = context.measureText(rsuLabel).width + 20;
+      context.fillStyle = "#111827";
+      context.beginPath();
+      context.roundRect(rsuX - labelWidth / 2, road.top - 25, labelWidth, 20, 6);
+      context.fill();
+      context.strokeStyle = "#facc15";
+      context.lineWidth = 2;
+      context.stroke();
+      context.fillStyle = "#facc15";
+      context.fillText(rsuLabel, rsuX, road.top - 11);
+      context.strokeStyle = "#facc15";
+      context.lineWidth = 3;
+      context.beginPath();
+      context.moveTo(rsuX, road.top - 5);
+      context.lineTo(rsuX, road.top + 7);
+      context.stroke();
+      context.fillStyle = "#facc15";
+      context.beginPath();
+      context.moveTo(rsuX - 7, road.top + 7);
+      context.lineTo(rsuX + 7, road.top + 7);
+      context.lineTo(rsuX, road.top - 1);
+      context.closePath();
+      context.fill();
+    }
+    context.restore();
+  }
+
+  function linkPosition(link, endpoint) {
+    if (endpoint === link.sender_id) return Number(link.sender_position);
+    return Number(link.receiver_position);
+  }
+
+  function drawLinks(view, road, laneHeight, snapshot, now) {
+    const vehicles = new Map(
+      (snapshot.vehicles || []).map(vehicle => [vehicle.vehicle_id, vehicle])
+    );
+    const rsu = state.rsu;
+    for (const link of state.links) {
+      const age = now - link.receivedAt;
+      if (age > 1800) continue;
+      let senderPosition = linkPosition(link, link.sender_id);
+      let receiverPosition = linkPosition(link, link.receiver_id);
+      const senderVehicle = vehicles.get(link.sender_id);
+      const receiverVehicle = vehicles.get(link.receiver_id);
+      if (senderVehicle) senderPosition = senderVehicle.position;
+      else if (rsu && link.sender_id === rsu.unit_id) senderPosition = Number(rsu.position);
+      if (receiverVehicle) receiverPosition = receiverVehicle.position;
+      else if (rsu && link.receiver_id === rsu.unit_id) receiverPosition = Number(rsu.position);
+      if (!Number.isFinite(senderPosition) || !Number.isFinite(receiverPosition)) continue;
+
+      const laneY = vehicle => {
+        if (!vehicle) return road.top + road.laneHeight * 0.5;
+        const index = Number(String(vehicle.lane_id).split("_").pop()) || 0;
+        return road.top + laneHeight * (index + 0.5);
+      };
+      const y1 = laneY(senderVehicle);
+      const y2 = laneY(receiverVehicle);
+      const alpha = Math.max(0, 1 - age / 1800);
+      context.save();
+      context.globalAlpha = alpha;
+      const lineStyles = {
+        V2V: { color: "#38bdf8", dash: [], width: 2 },
+        V2I: { color: "#fb923c", dash: [8, 4], width: 3 },
+        I2V: { color: "#facc15", dash: [2, 5], width: 3 },
+      };
+      const style = lineStyles[link.communication_type] || lineStyles.V2V;
+      context.strokeStyle = style.color;
+      context.lineWidth = style.width;
+      context.setLineDash(style.dash);
+      context.lineDashOffset = -age / 30;
+      context.beginPath();
+      context.moveTo(worldToScreen(senderPosition, view), y1);
+      context.lineTo(worldToScreen(receiverPosition, view), y2);
+      context.stroke();
+      context.restore();
+    }
+  }
+
+  function vehicleLabel(vehicle) {
+    return vehicle.vehicle_id === "emergency_truck"
+      ? "EMERGENCY TRUCK"
+      : `${vehicle.vehicle_id} / ${vehicle.vehicle_type}`;
+  }
+
+  function allocateLabelRows(vehicles, view) {
+    const byLane = new Map();
+    for (const vehicle of vehicles) {
+      const laneIndex = Number(String(vehicle.lane_id).split("_").pop()) || 0;
+      const laneVehicles = byLane.get(laneIndex) || [];
+      laneVehicles.push(vehicle);
+      byLane.set(laneIndex, laneVehicles);
+    }
+
+    const rowsById = new Map();
+    context.font = "11px system-ui";
+    for (const laneVehicles of byLane.values()) {
+      laneVehicles.sort((left, right) => left.position - right.position);
+      const rowEnds = [];
+      for (const vehicle of laneVehicles) {
+        const centerX = worldToScreen(
+          vehicle.position - vehicle.length / 2,
+          view
+        );
+        const labelWidth = context.measureText(vehicleLabel(vehicle)).width;
+        const left = centerX - labelWidth / 2;
+        const row = rowEnds.findIndex(end => left > end + 8);
+        const rowIndex = row < 0 ? rowEnds.length : row;
+        rowEnds[rowIndex] = centerX + labelWidth / 2;
+        rowsById.set(vehicle.vehicle_id, rowIndex);
+      }
+    }
+    return rowsById;
+  }
+
+  function drawVehicle(vehicle, view, road, laneHeight, labelRow) {
+    const laneIndex = Number(String(vehicle.lane_id).split("_").pop()) || 0;
+    const centerX = worldToScreen(
+      vehicle.position - vehicle.length / 2,
+      view
+    );
+    const centerY = road.top + laneHeight * (laneIndex + 0.5);
+    const isTruck = vehicle.vehicle_id === "emergency_truck";
+    const vehicleWidth = Math.max(
+      isTruck ? 34 : 16,
+      Math.min(isTruck ? 52 : 30, vehicle.length * view.scale)
+    );
+    const vehicleHeight = isTruck ? 24 : 18;
+    const color = colors[vehicle.vehicle_id] || (isTruck ? "#ef4444" : "#94a3b8");
+
+    context.save();
+    context.translate(centerX, centerY);
+    context.fillStyle = color;
+    context.strokeStyle = isTruck ? "#fecaca" : "#f8fafc";
+    context.lineWidth = isTruck ? 2 : 1;
+    context.beginPath();
+    context.roundRect(-vehicleWidth / 2, -vehicleHeight / 2, vehicleWidth, vehicleHeight, isTruck ? 4 : 7);
+    context.fill();
+    context.stroke();
+    context.fillStyle = "#111827";
+    if (isTruck) {
+      context.fillRect(
+        -vehicleWidth / 2 + 5,
+        -vehicleHeight / 2 + 4,
+        vehicleWidth * 0.57,
+        vehicleHeight - 8
+      );
+      context.fillStyle = "#fecaca";
+      context.fillRect(
+        vehicleWidth / 2 - 10,
+        -vehicleHeight / 2 - 3,
+        5,
+        4
+      );
+    } else {
+      context.fillRect(
+        -vehicleWidth / 2 + 4,
+        -vehicleHeight / 2 + 3,
+        vehicleWidth - 8,
+        vehicleHeight / 2 - 1
+      );
+    }
+    context.restore();
+
+    context.fillStyle = isTruck ? "#fecaca" : "#f8fafc";
+    context.strokeStyle = "#111827";
+    context.lineWidth = 3;
+    context.font = isTruck ? "bold 11px system-ui" : "11px system-ui";
+    context.textAlign = "center";
+    context.lineJoin = "round";
+    const label = vehicleLabel(vehicle);
+    const labelY = centerY - vehicleHeight / 2 - 8 - labelRow * 14;
+    context.strokeText(label, centerX, labelY);
+    context.fillText(label, centerX, labelY);
+  }
+
+  function render(now) {
+    const bounds = canvas.getBoundingClientRect();
+    const width = bounds.width;
+    const height = bounds.height;
+    const snapshot = interpolateSnapshot(now);
+    context.clearRect(0, 0, width, height);
+    if (!snapshot) {
+      context.fillStyle = "#e5e7eb";
+      context.font = "16px system-ui";
+      context.fillText("Start a SUMO run to view live traffic.", 24, 40);
+      requestAnimationFrame(render);
+      return;
+    }
+
+    const laneIndices = (snapshot.vehicles || []).map(
+      vehicle => Number(String(vehicle.lane_id).split("_").pop()) || 0
+    );
+    const laneCount = Math.max(2, ...laneIndices.map(index => index + 1));
+    const road = drawRoad(width, height, laneCount);
+    const positions = (snapshot.vehicles || []).map(vehicle => vehicle.position);
+    if (state.rsu) positions.push(Number(state.rsu.position));
+    const minPosition = Math.min(...positions);
+    const maxPosition = Math.max(...positions);
+    const extent = Math.max(maxPosition - minPosition, 320);
+    const horizontalPadding = Math.min(68, width * 0.16);
+    const scale = Math.max(
+      0.01,
+      (width - horizontalPadding * 2) / extent
+    );
+    const view = {
+      left: minPosition - horizontalPadding / scale,
+      scale,
+    };
+
+    context.fillStyle = "#e2e8f0";
+    context.font = "bold 13px system-ui";
+    context.textAlign = "left";
+    context.fillText(
+      `SUMO time ${Number(snapshot.simulation_time).toFixed(1)} s | ${state.label}`,
+      14,
+      24
+    );
+    drawCoverage(view, road, width, snapshot);
+    drawLinks(view, road, road.laneHeight, snapshot, now);
+    const labelRows = allocateLabelRows(snapshot.vehicles || [], view);
+    for (const vehicle of snapshot.vehicles || []) {
+      drawVehicle(
+        vehicle,
+        view,
+        road,
+        road.laneHeight,
+        labelRows.get(vehicle.vehicle_id) || 0
+      );
+    }
+
+    context.fillStyle = "#cbd5e1";
+    context.font = "11px system-ui";
+    context.textAlign = "left";
+    context.fillText(
+      "V2V solid cyan | V2I dashed orange | I2V dotted yellow",
+      14,
+      height - 12
+    );
+    requestAnimationFrame(render);
+  }
+
+  window.addEventListener("message", receiveRender);
+  window.addEventListener("resize", resizeCanvas);
+  window.parent.postMessage(
+    { isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 },
+    "*"
+  );
+  window.parent.postMessage(
+    { isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: 460 },
+    "*"
+  );
+  resizeCanvas();
+  requestAnimationFrame(render);
+})();
+</script>
+</body>
+</html>
