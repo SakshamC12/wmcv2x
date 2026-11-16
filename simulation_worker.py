@@ -322,7 +322,6 @@ class SimulationWorker:
                 else self._simulation_runner
             )
             runner_options = {
-                "gui": False,
                 "on_step": self._publish_telemetry,
                 "on_event": self._publish_event,
                 "should_continue": self._before_step,
@@ -330,6 +329,7 @@ class SimulationWorker:
             if self.comparison_modes is not None:
                 runner_options["modes"] = self.comparison_modes
             else:
+                runner_options["gui"] = False
                 runner_options["communication_mode"] = self.communication_mode
             results = runner(self.settings, **runner_options)
             with self._state_lock:

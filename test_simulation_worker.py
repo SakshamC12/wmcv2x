@@ -12,6 +12,7 @@ from simulation_worker import (
     WorkerState,
 )
 from sumo_simulation import SimulationSettings, run_sumo_simulation
+from v2x_communication import CommunicationMode
 
 
 def _fake_runner(
@@ -196,6 +197,57 @@ class SimulationWorkerLifecycleTest(unittest.TestCase):
         self.assertTrue(worker.join(timeout=30))
         self.assertEqual(worker.state, WorkerState.COMPLETED)
         self.assertFalse(traci.connection.has("default"))
+
+    def test_comparison_runner_receives_only_supported_options(self):
+        received_modes = []
+
+        def comparison_runner(
+            settings,
+            *,
+            modes,
+            on_step,
+            on_event,
+            should_continue,
+        ):
+            del settings, on_step, on_event, should_continue
+            received_modes.extend(modes)
+            return {"stopped": False, "comparison_results": {}}
+
+        modes = tuple(CommunicationMode)
+        worker = SimulationWorker(
+            comparison_runner=comparison_runner,
+            comparison_modes=modes,
+        )
+        worker.start()
+        self.assertTrue(worker.join(timeout=5))
+
+        self.assertEqual(worker.state, WorkerState.COMPLETED)
+        self.assertEqual(received_modes, list(modes))
+
+    def test_real_four_mode_comparison_completes_through_worker(self):
+        modes = tuple(CommunicationMode)
+        worker = SimulationWorker(
+            SimulationSettings(end_time=10.0),
+            comparison_modes=modes,
+        )
+        worker.start()
+        self.assertTrue(worker.join(timeout=60))
+
+        self.assertEqual(worker.state, WorkerState.COMPLETED, worker.error)
+        results = worker.results["comparison_results"]
+        self.assertEqual(
+            set(results),
+            {mode.value for mode in modes},
+        )
+        for mode in modes:
+            with self.subTest(mode=mode.value):
+                result = results[mode.value]
+                self.assertEqual(
+                    result["communication_mode"],
+                    mode.value,
+                )
+                self.assertIn("metrics", result)
+                self.assertIn("message_log", result)
 
     def test_error_closes_traci_connection(self):
         def raising_callback(snapshot):

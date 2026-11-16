@@ -1,6 +1,7 @@
 
-import time
+import html
 import math
+import time
 from dataclasses import asdict, replace
 from queue import Empty
 
@@ -23,8 +24,14 @@ def _initialize_command_center_state() -> SimulationWorker:
         st.session_state.command_center_telemetry = None
         st.session_state.command_center_events = []
         st.session_state.command_center_comparison = False
+        st.session_state.command_center_live_min_separation = None
+        st.session_state.command_center_live_min_ttc = None
+        st.session_state.command_center_acknowledged_collisions = set()
     st.session_state.setdefault("command_center_comparison", False)
     st.session_state.setdefault("command_center_render_generation", 0)
+    st.session_state.setdefault("command_center_live_min_separation", None)
+    st.session_state.setdefault("command_center_live_min_ttc", None)
+    st.session_state.setdefault("command_center_acknowledged_collisions", set())
     return st.session_state.command_center_worker
 
 
@@ -42,6 +49,161 @@ def _warning_level(message: dict[str, object]) -> str:
     if message.get("response_recommended"):
         return "HAZARD"
     return "MONITOR"
+
+
+def _render_alerts(alerts: list[tuple[str, str, str]]) -> None:
+    if not alerts:
+        return
+    colors = {
+        "collision": ("#7f1d1d", "#fecaca", "#ef4444"),
+        "emergency": ("#7c2d12", "#ffedd5", "#f97316"),
+        "response": ("#064e3b", "#d1fae5", "#10b981"),
+        "v2v": ("#082f49", "#e0f2fe", "#38bdf8"),
+        "v2i": ("#7c2d12", "#ffedd5", "#fb923c"),
+        "i2v": ("#713f12", "#fef9c3", "#facc15"),
+        "combined": ("#164e63", "#cffafe", "#06b6d4"),
+        "success": ("#064e3b", "#d1fae5", "#10b981"),
+    }
+    cards = []
+    for title, message, tone in alerts:
+        background, foreground, accent = colors[tone]
+        cards.append(
+            f'<div role="status" style="border-left:6px solid {accent};'
+            f'background:{background};color:{foreground};padding:0.5rem 0.7rem;'
+            f'border-radius:0.45rem;box-shadow:0 4px 16px #0005">'
+            f'<div style="font-size:1rem;font-weight:800">'
+            f'{html.escape(title)}</div>'
+            f'<div style="font-size:0.82rem;margin-top:0.15rem">'
+            f'{html.escape(message)}</div></div>'
+        )
+    st.markdown(
+        '<div aria-label="V2X safety alerts" style="position:fixed;'
+        'top:5rem;right:1rem;width:min(340px,calc(100vw - 2rem));'
+        'max-height:30vh;overflow-y:auto;display:flex;flex-direction:column;'
+        'gap:0.45rem;z-index:10000;pointer-events:none">'
+        + "".join(cards)
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _snapshot_minimums(vehicles) -> tuple[float | None, float | None]:
+    lanes = {}
+    for vehicle in vehicles:
+        lanes.setdefault(vehicle.lane_id, []).append(vehicle)
+
+    separations = []
+    ttcs = []
+    for lane_vehicles in lanes.values():
+        lane_vehicles.sort(key=lambda vehicle: vehicle.position)
+        for follower, leader in zip(lane_vehicles, lane_vehicles[1:]):
+            gap = leader.position - leader.length - follower.position
+            separations.append(gap)
+            closing_speed = follower.speed - leader.speed
+            if gap > 0 and closing_speed > 0:
+                ttcs.append(gap / closing_speed)
+    return (
+        min(separations) if separations else None,
+        min(ttcs) if ttcs else None,
+    )
+
+
+def _event_collision_key(event) -> tuple:
+    vehicle_ids = tuple(sorted(event.data.get("vehicle_ids", ())))
+    return (
+        event.run_id,
+        event.data.get("communication_mode", ""),
+        event.simulation_time,
+        vehicle_ids,
+    )
+
+
+def _acknowledge_collision_alert(event_keys: tuple[tuple, ...]) -> None:
+    acknowledged = set(
+        st.session_state.command_center_acknowledged_collisions
+    )
+    acknowledged.update(event_keys)
+    st.session_state.command_center_acknowledged_collisions = acknowledged
+
+
+def _communication_notices(events) -> list[tuple[str, str, str]]:
+    transmissions = {}
+    receptions = {}
+    for event in events:
+        data = event.data
+        mode = data.get("communication_mode", "")
+        communication_type = data.get("communication_type")
+        if event.event_type == "V2X_TRANSMISSION" and communication_type in (
+            "V2V", "V2I", "I2V"
+        ):
+            key = (
+                event.run_id,
+                mode,
+                communication_type,
+                data.get("message_id"),
+            )
+            group = transmissions.setdefault(key, set())
+            receiver = data.get("receiver_id")
+            if receiver:
+                group.add(receiver)
+        elif event.event_type in (
+            "V2X_MESSAGE_RECEIVED",
+            "RSU_MESSAGE_RECEIVED",
+        ):
+            message = data.get("message") or {}
+            communication_type = data.get("communication_type") or message.get(
+                "communication_type"
+            )
+            if communication_type not in ("V2V", "V2I", "I2V"):
+                continue
+            key = (
+                event.run_id,
+                mode,
+                communication_type,
+                data.get("message_id") or message.get("message_id"),
+            )
+            group = receptions.setdefault(key, set())
+            receiver = data.get("receiver_id") or data.get("vehicle_id")
+            if receiver:
+                group.add(receiver)
+
+    labels = {
+        "V2V": (
+            "V2V WARNING BROADCAST",
+            "Emergency message transmitted directly to connected vehicles.",
+            "v2v",
+        ),
+        "V2I": (
+            "V2I MESSAGE RECEIVED",
+            "Emergency truck has reported the hazard to the RSU.",
+            "v2i",
+        ),
+        "I2V": (
+            "RSU WARNING BROADCAST",
+            "Roadside unit has redistributed the emergency warning.",
+            "i2v",
+        ),
+    }
+    notices = []
+    for communication_type in ("V2V", "V2I", "I2V"):
+        matching = [
+            (key, recipients)
+            for key, recipients in transmissions.items()
+            if key[2] == communication_type
+        ]
+        if not matching:
+            continue
+        key, recipients = matching[-1]
+        delivered = receptions.get(key, set())
+        title, description, tone = labels[communication_type]
+        count_text = (
+            f" Intended recipients: {len(recipients)}; successful deliveries: "
+            f"{len(delivered)}."
+            if recipients or delivered
+            else ""
+        )
+        notices.append((title, description + count_text, tone))
+    return notices
 
 
 @st.fragment(run_every=0.25)
@@ -93,6 +255,9 @@ def _render_command_center_live() -> None:
             st.session_state.command_center_render_generation += 1
             st.session_state.command_center_telemetry = None
             st.session_state.command_center_events = []
+            st.session_state.command_center_live_min_separation = None
+            st.session_state.command_center_live_min_ttc = None
+            st.session_state.command_center_acknowledged_collisions = set()
             worker.comparison_modes = None
             st.session_state.command_center_comparison = False
             worker.start()
@@ -140,6 +305,9 @@ def _render_command_center_live() -> None:
         else:
             st.session_state.command_center_telemetry = None
             st.session_state.command_center_events = []
+            st.session_state.command_center_live_min_separation = None
+            st.session_state.command_center_live_min_ttc = None
+            st.session_state.command_center_acknowledged_collisions = set()
             st.session_state.command_center_comparison = False
             st.session_state.command_center_render_generation += 1
             worker.comparison_modes = None
@@ -156,15 +324,28 @@ def _render_command_center_live() -> None:
             st.session_state.command_center_render_generation += 1
             st.session_state.command_center_telemetry = None
             st.session_state.command_center_events = []
+            st.session_state.command_center_live_min_separation = None
+            st.session_state.command_center_live_min_ttc = None
+            st.session_state.command_center_acknowledged_collisions = set()
             worker.start()
         except RuntimeError as error:
             st.error(str(error))
 
     while True:
         try:
-            st.session_state.command_center_telemetry = (
-                worker.telemetry_queue.get_nowait()
-            )
+            telemetry_snapshot = worker.telemetry_queue.get_nowait()
+            st.session_state.command_center_telemetry = telemetry_snapshot
+            separation, ttc = _snapshot_minimums(telemetry_snapshot.vehicles)
+            if separation is not None:
+                previous = st.session_state.command_center_live_min_separation
+                st.session_state.command_center_live_min_separation = (
+                    separation if previous is None else min(previous, separation)
+                )
+            if ttc is not None:
+                previous = st.session_state.command_center_live_min_ttc
+                st.session_state.command_center_live_min_ttc = (
+                    ttc if previous is None else min(previous, ttc)
+                )
         except Empty:
             break
 
@@ -179,10 +360,235 @@ def _render_command_center_live() -> None:
     telemetry = st.session_state.command_center_telemetry
     events = st.session_state.command_center_events
     state = worker.state
+    results = worker.results
+    comparison_results = (
+        results.get("comparison_results")
+        if results and st.session_state.command_center_comparison
+        else None
+    )
+    metrics = results.get("metrics") if results else None
 
     st.caption(f"Simulation status: **{state.value.replace('_', ' ').title()}**")
     if worker.error:
         st.error(worker.error)
+
+    collision_events = [
+        event for event in events
+        if event.event_type == "COLLISION_DETECTED"
+    ]
+    alert_items = []
+    acknowledged = st.session_state.command_center_acknowledged_collisions
+    unacknowledged_collisions = [
+        event for event in collision_events
+        if _event_collision_key(event) not in acknowledged
+    ]
+    if unacknowledged_collisions:
+        collision_ids = sorted({
+            vehicle_id
+            for event in unacknowledged_collisions
+            for vehicle_id in event.data.get("vehicle_ids", ())
+        })
+        collision_times = [
+            event.simulation_time
+            for event in unacknowledged_collisions
+            if event.simulation_time is not None
+        ]
+        collision_modes = sorted({
+            mode_labels.get(
+                CommunicationMode(event.data["communication_mode"]),
+                event.data["communication_mode"],
+            )
+            for event in unacknowledged_collisions
+            if event.data.get("communication_mode") in {
+                mode.value for mode in CommunicationMode
+            }
+        })
+        collision_count = len({
+            (
+                event.data.get("communication_mode", ""),
+                tuple(sorted(event.data.get("vehicle_ids", ()))),
+            )
+            for event in unacknowledged_collisions
+        })
+        time_text = (
+            f"Simulation time: {max(collision_times):.1f} s. "
+            if collision_times else ""
+        )
+        mode_text = f" Scenario(s): {', '.join(collision_modes)}." if collision_modes else ""
+        alert_items.append(
+            (
+                "COLLISION DETECTED",
+                f"{time_text}{collision_count} collision pair(s) recorded. "
+                f"Involved vehicles: {', '.join(collision_ids) or 'IDs unavailable'}."
+                f"{mode_text}",
+                "collision",
+            )
+        )
+
+    emergency_events = [
+        event for event in events
+        if event.event_type == "EMERGENCY_BRAKING"
+    ]
+    if emergency_events:
+        event = emergency_events[-1]
+        mode_value = event.data.get(
+            "communication_mode",
+            worker.communication_mode.value,
+        )
+        mode = CommunicationMode(mode_value)
+        mode_text = mode_labels[mode]
+        warning_status = (
+            "V2X safety warning generated."
+            if mode is not CommunicationMode.DISABLED
+            else "V2X message delivery is disabled for this baseline run."
+        )
+        alert_items.append(
+            (
+                "EMERGENCY BRAKING DETECTED",
+                f"Emergency vehicle: {event.data.get('vehicle_id', 'unknown')}. "
+                f"Simulation time: {event.simulation_time:.1f} s. {warning_status} "
+                f"Mode: {mode_text}.",
+                "emergency",
+            )
+        )
+
+    response_events = [
+        event for event in events
+        if event.event_type == "V2X_BRAKE_RESPONSE"
+    ]
+    if response_events:
+        latest = response_events[-1]
+        latest_mode = latest.data.get("communication_mode", "")
+        latest_time = latest.simulation_time
+        latest_group = [
+            event for event in response_events
+            if event.data.get("communication_mode", "") == latest_mode
+            and event.simulation_time == latest_time
+        ]
+        responding_ids = sorted({
+            event.data.get("vehicle_id", "unknown")
+            for event in latest_group
+        })
+        alert_items.append(
+            (
+                "CONNECTED VEHICLES RESPONDING",
+                f"{len(responding_ids)} vehicle(s) applied braking at "
+                f"{latest_time:.1f} s: {', '.join(responding_ids)}.",
+                "response",
+            )
+        )
+
+    alert_items.extend(_communication_notices(events))
+
+    combined_active = any(
+        event.event_type == "EMERGENCY_BRAKING"
+        and event.data.get(
+            "communication_mode",
+            worker.communication_mode.value,
+        ) == CommunicationMode.COMBINED.value
+        for event in events
+    )
+    if combined_active:
+        combined_transmissions = [
+            event for event in events
+            if event.event_type == "V2X_TRANSMISSION"
+            and event.data.get("communication_type") in ("V2V", "V2I", "I2V")
+            and (
+                not st.session_state.command_center_comparison
+                or event.data.get("communication_mode")
+                == CommunicationMode.COMBINED.value
+            )
+        ]
+        recipients = {
+            event.data.get("receiver_id")
+            for event in combined_transmissions
+            if event.data.get("receiver_id")
+        }
+        alert_items.append(
+            (
+                "COMBINED V2X ACTIVE",
+                "Direct and infrastructure-assisted communication paths are enabled. "
+                f"Observed recipient endpoints: {len(recipients)}.",
+                "combined",
+            )
+        )
+    if state is WorkerState.COMPLETED:
+        completed_collisions = (
+            sum(
+                scenario["metrics"]["collisions"]
+                for scenario in comparison_results.values()
+            )
+            if comparison_results
+            else metrics["collisions"] if metrics else 0
+        )
+        if (comparison_results is not None or metrics is not None) and completed_collisions == 0:
+            alert_items.append(
+                ("NO COLLISION RECORDED", "No confirmed SUMO collision was reported.", "success")
+            )
+
+    _render_alerts(alert_items)
+
+    if comparison_results is None:
+        live_response_ids = {
+            (
+                event.data.get("communication_mode", ""),
+                event.data.get("vehicle_id"),
+            ) if st.session_state.command_center_comparison
+            else event.data.get("vehicle_id")
+            for event in response_events
+            if event.data.get("vehicle_id")
+        }
+        live_collision_pairs = {
+            (
+                event.data.get("communication_mode", ""),
+                tuple(sorted(event.data.get("vehicle_ids", ()))),
+            ) if st.session_state.command_center_comparison
+            else tuple(sorted(event.data.get("vehicle_ids", ())))
+            for event in collision_events
+        }
+        live_transmissions = {
+            (
+                event.data.get("communication_mode", ""),
+                event.data.get("communication_type"),
+                event.data.get("message_id"),
+                event.data.get("sender_id"),
+            )
+            for event in events
+            if event.event_type == "V2X_TRANSMISSION"
+        }
+        live_received = sum(
+            event.event_type in ("V2X_MESSAGE_RECEIVED", "RSU_MESSAGE_RECEIVED")
+            for event in events
+        )
+        if metrics:
+            min_separation = metrics["minimum_vehicle_separation_m"]
+            min_ttc = metrics["minimum_ttc_s"]
+            responding_count = metrics["vehicles_responding"]
+            collision_count = metrics["collisions"]
+            sent_count = metrics["messages_transmitted"]
+            received_count = metrics["messages_received"]
+        else:
+            min_separation = st.session_state.command_center_live_min_separation
+            min_ttc = st.session_state.command_center_live_min_ttc
+            responding_count = len(live_response_ids)
+            collision_count = len(live_collision_pairs)
+            sent_count = len(live_transmissions)
+            received_count = live_received
+        st.subheader("Live Performance Highlights")
+        columns = st.columns(5)
+        columns[0].metric(
+            "Minimum separation",
+            f"{min_separation:.2f} m" if min_separation is not None else "—",
+            help="Same-lane bumper gap; live values are based on observed telemetry.",
+        )
+        columns[1].metric(
+            "Minimum TTC",
+            f"{min_ttc:.2f} s" if min_ttc is not None else "—",
+            help="Positive-gap closing TTC; final value comes from SUMO run metrics.",
+        )
+        columns[2].metric("Vehicles responding", responding_count)
+        columns[3].metric("Collisions", collision_count)
+        columns[4].metric("Messages sent / received", f"{sent_count} / {received_count}")
 
     st.subheader("Live SUMO Highway")
     render_highway_canvas(
@@ -201,6 +607,18 @@ def _render_command_center_live() -> None:
             f"{st.session_state.command_center_render_generation}"
         ),
     )
+    if unacknowledged_collisions:
+        st.button(
+            "Acknowledge collision alert",
+            key="acknowledge-collision",
+            on_click=_acknowledge_collision_alert,
+            args=(
+                tuple(
+                    _event_collision_key(event)
+                    for event in unacknowledged_collisions
+                ),
+            ),
+        )
 
     vehicles = telemetry.vehicles if telemetry is not None else ()
     if vehicles:
@@ -225,45 +643,96 @@ def _render_command_center_live() -> None:
         for event in events
         if event.event_type == "V2X_MESSAGE_RECEIVED"
     ]
-    response_events = [
-        event for event in events
-        if event.event_type == "V2X_BRAKE_RESPONSE"
-    ]
-    results = worker.results
-    comparison_results = (
-        results.get("comparison_results")
-        if results and st.session_state.command_center_comparison
-        else None
-    )
-    metrics = results.get("metrics") if results else None
     st.subheader("V2X Performance")
     if comparison_results:
-        st.caption("Completed scenario metrics (all communication values are modeled).")
-        st.dataframe(
-            [
-                {
-                    "Mode": mode_labels[CommunicationMode(mode)],
-                    "Collision pairs": scenario["metrics"]["collisions"],
-                    "Minimum separation (m)": (
-                        scenario["metrics"]["minimum_vehicle_separation_m"]
-                    ),
-                    "Minimum TTC (s)": scenario["metrics"]["minimum_ttc_s"],
-                    "Responding vehicles": (
-                        scenario["metrics"]["vehicles_responding"]
-                    ),
-                    "Warning distance (m)": scenario["metrics"]["warning_distance_m"],
-                    "Delivery ratio (%)": (
-                        scenario["metrics"]["packet_delivery_ratio_percent"]
-                    ),
-                    "Modeled latency (ms)": (
-                        scenario["metrics"]["communication_latency_ms"]
-                    ),
-                }
-                for mode, scenario in comparison_results.items()
-            ],
-            width="stretch",
-            hide_index=True,
+        comparison_complete = all(
+            mode.value in comparison_results for mode in CommunicationMode
         )
+        if comparison_complete:
+            st.caption(
+                "Completed experiments use identical initial conditions. "
+                "Communication metrics are modeled, not wireless measurements."
+            )
+        else:
+            st.info(
+                "Comparison stopped before all four modes completed; "
+                "showing results returned so far."
+            )
+        comparison_labels = {
+            CommunicationMode.DISABLED: "V2X Disabled",
+            CommunicationMode.V2V: "V2V Only",
+            CommunicationMode.V2I: "V2I Only",
+            CommunicationMode.COMBINED: "Combined V2X",
+        }
+        comparison_order = tuple(
+            mode for mode in CommunicationMode if mode.value in comparison_results
+        )
+        cards = st.columns(max(1, len(comparison_order)))
+        separation_chart = []
+        ttc_chart = []
+        for column, mode in zip(cards, comparison_order):
+            scenario = comparison_results[mode.value]
+            scenario_metrics = scenario["metrics"]
+            with column.container(border=True):
+                st.markdown(f"#### {comparison_labels[mode]}")
+                if mode is CommunicationMode.DISABLED:
+                    st.caption("Baseline reference")
+                st.metric(
+                    "Minimum separation",
+                    (
+                        f"{scenario_metrics['minimum_vehicle_separation_m']:.2f} m"
+                        if scenario_metrics["minimum_vehicle_separation_m"] is not None
+                        else "—"
+                    ),
+                )
+                st.metric(
+                    "Minimum TTC",
+                    (
+                        f"{scenario_metrics['minimum_ttc_s']:.2f} s"
+                        if scenario_metrics["minimum_ttc_s"] is not None
+                        else "—"
+                    ),
+                )
+                st.metric(
+                    "Vehicles responding",
+                    scenario_metrics["vehicles_responding"],
+                )
+                st.metric("Collisions", scenario_metrics["collisions"])
+            if scenario_metrics["minimum_vehicle_separation_m"] is not None:
+                separation_chart.append({
+                    "Mode": comparison_labels[mode],
+                    "Minimum separation (m)": (
+                        scenario_metrics["minimum_vehicle_separation_m"]
+                    ),
+                })
+            if scenario_metrics["minimum_ttc_s"] is not None:
+                ttc_chart.append({
+                    "Mode": comparison_labels[mode],
+                    "Minimum TTC (s)": scenario_metrics["minimum_ttc_s"],
+                })
+        chart_columns = st.columns(2)
+        with chart_columns[0]:
+            st.markdown("##### Minimum separation by mode")
+            if separation_chart:
+                st.bar_chart(
+                    separation_chart,
+                    x="Mode",
+                    y="Minimum separation (m)",
+                )
+            else:
+                st.caption("No separation values were recorded.")
+        with chart_columns[1]:
+            st.markdown("##### Minimum TTC by mode")
+            if ttc_chart:
+                st.bar_chart(ttc_chart, x="Mode", y="Minimum TTC (s)")
+            else:
+                st.caption("No TTC values were recorded.")
+        baseline = comparison_results.get(CommunicationMode.DISABLED.value)
+        if baseline and baseline["metrics"]["collisions"] == 0:
+            st.info(
+                "The V2X-disabled baseline recorded no collisions; these results "
+                "do not demonstrate a collision prevented by V2X."
+            )
     if metrics:
         metric_values = [
             ("Broadcasts", metrics["messages_transmitted"]),

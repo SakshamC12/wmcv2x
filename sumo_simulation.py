@@ -347,7 +347,18 @@ def run_sumo_simulation(
                 del pending_responses[vehicle_id]
 
             controller.step()
-            collision_pairs.update(controller.collision_pairs())
+            new_collision_pairs = set(controller.collision_pairs()) - collision_pairs
+            collision_pairs.update(new_collision_pairs)
+            if on_event is not None:
+                for collider, victim in sorted(new_collision_pairs):
+                    on_event(
+                        {
+                            "event_type": "COLLISION_DETECTED",
+                            "time": controller.time,
+                            "vehicle_ids": [collider, victim],
+                            "collision_count": len(collision_pairs),
+                        }
+                    )
             frame_vehicles = [
                 controller.snapshot(vehicle_id).__dict__
                 for vehicle_id in controller.vehicle_ids()
